@@ -23,7 +23,7 @@
 ### 方式 1：快速安装脚本
 
 ```bash
-git clone https://github.com/DuMaChen/clipbridge.git
+git clone https://github.com/DuMaChen/clip-bridge.git
 cd clipbridge
 ./install.sh
 ```
