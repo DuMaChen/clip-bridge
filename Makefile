@@ -23,7 +23,7 @@ all: build
 build:
 ifeq ($(OS),Windows_NT)
 	@$(MKDIR)
-	"$(CSC)" /target:exe /optimize+ /platform:anycpu /out:bin/$(TARGET)$(EXE_EXT) Program.cs
+	"$(CSC)" /target:winexe /optimize+ /platform:anycpu /out:bin/$(TARGET)$(EXE_EXT) Program.cs
 else
 	@$(MKDIR)
 	swiftc -O -o bin/$(TARGET)$(EXE_EXT) main.swift

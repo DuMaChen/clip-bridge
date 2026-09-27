@@ -41,7 +41,7 @@ $targetExe = Join-Path $installDir "clipbridge.exe"
 # 4. Compile Program.cs
 Write-Host "🔨 Compiling ClipBridge with native C# compiler..." -ForegroundColor Yellow
 $compileArgs = @(
-    "/target:exe",
+    "/target:winexe",
     "/optimize+",
     "/platform:anycpu",
     "/out:$targetExe",
