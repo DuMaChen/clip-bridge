@@ -111,7 +111,7 @@ Windows 版所有设置均可通过托盘图标的设置界面修改，保存后
                        [截图工具 / 复制图片]
                                 |
                                 v
-         [ClipBridge 自动捕获并存盘为 ~/.agy_screenshots/screenshot_xxx.png]
+   [ClipBridge 自动捕获并存盘]（Windows: <图片>\clipbridge\，macOS: ~/.agy_screenshots/）
                                 |
        +------------------------+------------------------+
        v                                                 v
@@ -137,7 +137,7 @@ Windows 版所有设置均可通过托盘图标的设置界面修改，保存后
 | 平台 | 项目 | 默认路径 |
 | :--- | :--- | :--- |
 | **Windows** | 可执行程序 | `%USERPROFILE%\.local\bin\clipbridge.exe` |
-| | 截图存储目录 | `%USERPROFILE%\.agy_screenshots\`（可在设置中更改） |
+| | 截图存储目录 | `%USERPROFILE%\Pictures\clipbridge\`（可在设置中更改） |
 | | 配置文件 | `%USERPROFILE%\.agy_screenshots\config.ini` |
 | | 运行日志目录 | `%USERPROFILE%\.agy_screenshots\logs\` |
 | | 开机自启项 | 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (`ClipBridge`) |
@@ -152,7 +152,7 @@ Windows 版所有设置均可通过托盘图标的设置界面修改，保存后
 | :--- | :--- | :--- |
 | `enabled` | `1` | 剪贴板监听开关（托盘右键也可快速暂停/恢复） |
 | `auto_start` | `1` | 开机自启（HKCU Run） |
-| `storage_dir` | 空（默认目录） | 截图存储目录 |
+| `storage_dir` | 空（默认目录） | 截图存储目录（默认为 Windows `图片\clipbridge`） |
 | `max_age_days` | `7` | 截图保留天数 |
 | `max_count` | `200` | 最多保留张数 |
 | `add_rtf` | `1` | 为 Office 提供 RTF 内嵌图片（Word/Excel/PPT 粘贴为图片） |

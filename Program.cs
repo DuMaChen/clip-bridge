@@ -17,7 +17,7 @@ namespace ClipBridge
     static class Program
     {
         public const string APP_NAME = "clipbridge";
-        public const string APP_VERSION = "1.1.1";
+        public const string APP_VERSION = "1.1.2";
         public const string PROCESSED_TYPE = "com.antigravity.clipbridge.processed";
         public const string REG_RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         public const string REG_VALUE_NAME = "ClipBridge";
@@ -202,7 +202,21 @@ namespace ClipBridge
 
         public static string GetDefaultStorageDirectory()
         {
-            return GetSystemDirectory();
+            // Screenshots default to <Pictures>\clipbridge (follows OneDrive relocation
+            // of the Pictures folder automatically). Config/logs/pid stay in
+            // ~/.agy_screenshots so they remain easy to locate.
+            string dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                "clipbridge");
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            }
+            catch
+            {
+                return GetSystemDirectory(); // fall back if Pictures is unavailable
+            }
+            return dir;
         }
 
         public static string GetLogDirectory()
