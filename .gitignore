@@ -1,5 +1,9 @@
 .DS_Store
 bin/
 *.o
+*.obj
+*.pdb
 *.swp
+*.exe
 logs/
+.agy_screenshots/
