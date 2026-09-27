@@ -17,7 +17,7 @@ namespace ClipBridge
     static class Program
     {
         public const string APP_NAME = "clipbridge";
-        public const string APP_VERSION = "1.1.0";
+        public const string APP_VERSION = "1.1.1";
         public const string PROCESSED_TYPE = "com.antigravity.clipbridge.processed";
         public const string REG_RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         public const string REG_VALUE_NAME = "ClipBridge";
@@ -503,6 +503,19 @@ namespace ClipBridge
 
                 // 1. If clipboard contains our processed marker, skip to avoid feedback loop
                 if (Clipboard.ContainsData(PROCESSED_TYPE))
+                {
+                    return;
+                }
+
+                // 1.5 Office apps (PowerPoint/Excel/Word) attach OLE object formats when copying
+                // shapes/text-boxes/slides, together with a PNG preview of the shape. That is
+                // rich document content, NOT a screenshot: hijacking it would replace the
+                // copied text with a file path. Real screenshots / browser image copies never
+                // carry OLE formats, so skip whenever one is present.
+                if (Clipboard.ContainsData("Embed Source") ||
+                    Clipboard.ContainsData("Object Descriptor") ||
+                    Clipboard.ContainsData("Link Source") ||
+                    Clipboard.ContainsData("Link Source Descriptor"))
                 {
                     return;
                 }
