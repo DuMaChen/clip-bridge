@@ -24,6 +24,11 @@ func cleanupOldScreenshots(in directory: URL, maxAgeDays: Double = 7.0, maxCount
     var validFiles: [(url: URL, date: Date)] = []
     
     for file in files {
+        // Only our regular PNG captures; never configs, logs, directories or symlinks.
+        guard file.lastPathComponent.hasPrefix("screenshot_"),
+              file.pathExtension == "png",
+              let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true else { continue }
         if let attrs = try? fileManager.attributesOfItem(atPath: file.path),
            let creationDate = attrs[.creationDate] as? Date {
             let ageInDays = now.timeIntervalSince(creationDate) / (24 * 3600)
@@ -49,127 +54,156 @@ class ClipboardWatcher {
     private var lastChangeCount: Int
     private var timer: Timer?
     private let storageDir: URL
-    
+    private var richItems: [[NSPasteboard.PasteboardType: Data]]?
+    private var paths: [String] = []
+    private var pathMode: Bool?
+    private var activationObserver: NSObjectProtocol?
+    private let pathApps: Set<String>
+    private let mediaExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "heif", "tif", "tiff", "ico", "svg", "avif",
+        "mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "wma", "aiff",
+        "mp4", "mov", "mkv", "avi", "webm", "wmv", "m4v", "mpeg", "mpg"
+    ]
+
     init() {
-        self.lastChangeCount = pasteboard.changeCount
-        self.storageDir = getStorageDirectory()
+        lastChangeCount = pasteboard.changeCount
+        storageDir = getStorageDirectory()
+        let configured = try? String(contentsOf: storageDir.appendingPathComponent("path_apps.txt"), encoding: .utf8)
+        pathApps = Set((ProcessInfo.processInfo.environment["CLIPBRIDGE_PATH_APPS"] ?? configured ??
+            "com.apple.Terminal,com.googlecode.iterm2,dev.warp.Warp-Stable,com.microsoft.VSCode,com.todesktop.230313mzl4w4u92,com.openai.codex")
+            .components(separatedBy: CharacterSet(charactersIn: ",\r\n"))
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
     }
-    
+
     func start() {
-        print("[\(APP_NAME)] 🚀 ClipBridge started. Listening for screenshots & clipboard images...")
-        print("[\(APP_NAME)] 📁 Screenshots storage: \(storageDir.path)")
-        
-        // Initial cleanup
+        print("[\(APP_NAME)] Listening for screenshots & media files...")
+        print("[\(APP_NAME)] Screenshots storage: \(storageDir.path)")
         cleanupOldScreenshots(in: storageDir)
-        
-        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
             self?.checkPasteboard()
+            self?.publishForForeground()
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+            self?.checkPasteboard()
+            self?.publishForForeground()
         }
         RunLoop.main.run()
     }
-    
-    private func checkPasteboard() {
-        let currentCount = pasteboard.changeCount
-        if currentCount == lastChangeCount {
-            return
-        }
-        lastChangeCount = currentCount
-        
-        // Check if this change was made by us
-        if let types = pasteboard.types, types.contains(PROCESSED_TYPE) {
-            return
-        }
-        
-        // If it's already a file URL copied from Finder, check if it's an image
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
-           let firstURL = urls.first, firstURL.isFileURL {
-            let ext = firstURL.pathExtension.lowercased()
-            let imageExtensions = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "tiff"]
-            if imageExtensions.contains(ext) {
-                let currentStr = pasteboard.string(forType: .string)
-                if currentStr != firstURL.path {
-                    enrichPasteboardWithExistingFile(fileURL: firstURL)
-                }
-                return
+
+    // Materialize every original item/type before changing ownership. If any
+    // format cannot be read, leave the original clipboard completely untouched.
+    private func snapshot() -> [[NSPasteboard.PasteboardType: Data]]? {
+        guard let originals = pasteboard.pasteboardItems else { return nil }
+        var result: [[NSPasteboard.PasteboardType: Data]] = []
+        for original in originals {
+            var formats: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in original.types {
+                guard let data = original.data(forType: type) else { return nil }
+                formats[type] = data
             }
+            result.append(formats)
         }
-        
-        // Check if there is image data on pasteboard
-        guard let types = pasteboard.types else { return }
-        let hasImage = types.contains(.png) || types.contains(.tiff) || types.map({ $0.rawValue }).contains("public.png") || types.map({ $0.rawValue }).contains("public.tiff")
-        
-        if !hasImage {
+        return result
+    }
+
+    private func checkPasteboard() {
+        let count = pasteboard.changeCount
+        if count == lastChangeCount { return }
+        richItems = nil
+        paths = []
+        pathMode = nil
+        lastChangeCount = count
+        if pasteboard.types?.contains(PROCESSED_TYPE) == true { return }
+
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+           !urls.isEmpty, urls.allSatisfy({ $0.isFileURL }) {
+            guard urls.contains(where: { mediaExtensions.contains($0.pathExtension.lowercased()) }),
+                  var originals = snapshot(), !originals.isEmpty else { return }
+            // Keep all items/types, including non-media siblings and Finder cut metadata.
+            if urls.count == 1, originals.count == 1,
+               let image = NSImage(contentsOf: urls[0]),
+               let tiff = image.tiffRepresentation,
+               let bitmap = NSBitmapImageRep(data: tiff),
+               let png = bitmap.representation(using: .png, properties: [:]) {
+                originals[0][.png] = png
+                originals[0][.tiff] = tiff
+            }
+            guard pasteboard.changeCount == count else { return }
+            richItems = originals
+            paths = urls.map { $0.path }
+            publishForForeground()
             return
         }
-        
-        // Extract Image
-        guard let image = NSImage(pasteboard: pasteboard) else {
-            return
-        }
-        
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            return
-        }
-        
-        // Save to file
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd_HHmmss_SSS"
-        let filename = "screenshot_\(formatter.string(from: Date())).png"
+
+        guard let types = pasteboard.types,
+              types.contains(.png) || types.contains(.tiff),
+              let image = NSImage(pasteboard: pasteboard),
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]),
+              pasteboard.changeCount == count else { return }
+        let filename = "screenshot_\(Int(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString).png"
         let fileURL = storageDir.appendingPathComponent(filename)
-        
         do {
-            try pngData.write(to: fileURL)
-            print("[\(APP_NAME)] 📸 Image captured: \(fileURL.path)")
-            
-            // Re-write pasteboard with multi-type item:
-            // 1. .png & .tiff -> Rich image for WeChat / Slack / Browsers
-            // 2. .string -> Plain path for Terminal / CLI / Code editors
-            // 3. .fileURL -> File reference for Finder / file managers
-            // 4. PROCESSED_TYPE -> prevent loop
-            let item = NSPasteboardItem()
-            item.setData(pngData, forType: .png)
-            item.setData(tiffData, forType: .tiff)
-            item.setString(fileURL.path, forType: .string)
-            item.setString(fileURL.absoluteString, forType: .fileURL)
-            item.setString("1", forType: PROCESSED_TYPE)
-            
-            pasteboard.clearContents()
-            pasteboard.writeObjects([item])
-            
-            // Update last change count to prevent self-triggering
-            self.lastChangeCount = pasteboard.changeCount
-            
-            // Periodically clean up
+            try png.write(to: fileURL, options: .atomic)
+            guard pasteboard.changeCount == count else { return }
+            richItems = [[.png: png, .tiff: tiff,
+                          .fileURL: Data(fileURL.absoluteString.utf8)]]
+            paths = [fileURL.path]
+            print("[\(APP_NAME)] Image captured: \(fileURL.path)")
+            publishForForeground()
             cleanupOldScreenshots(in: storageDir)
         } catch {
-            print("[\(APP_NAME)] ❌ Error saving screenshot: \(error)")
+            print("[\(APP_NAME)] Error saving screenshot: \(error)")
         }
     }
-    
-    private func enrichPasteboardWithExistingFile(fileURL: URL) {
-        guard let image = NSImage(contentsOf: fileURL),
-              let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+
+    private func publishForForeground() {
+        guard let originals = richItems else { return }
+        guard pasteboard.changeCount == lastChangeCount else {
+            richItems = nil
+            paths = []
+            pathMode = nil
             return
         }
-        
-        let item = NSPasteboardItem()
-        item.setData(pngData, forType: .png)
-        item.setData(tiffData, forType: .tiff)
-        item.setString(fileURL.path, forType: .string)
-        item.setString(fileURL.absoluteString, forType: .fileURL)
-        item.setString("1", forType: PROCESSED_TYPE)
-        
-        pasteboard.clearContents()
-        pasteboard.writeObjects([item])
-        self.lastChangeCount = pasteboard.changeCount
-        print("[\(APP_NAME)] 📎 File path enriched: \(fileURL.path)")
+        let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.lowercased() ?? ""
+        let wantsPaths = pathApps.contains(bundleID)
+        if pathMode == wantsPaths { return }
+        var formats = originals
+        if wantsPaths {
+            formats = [[.string: Data(paths.joined(separator: "\n").utf8)]]
+        }
+        let items = formats.map { entries -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in entries { item.setData(data, forType: type) }
+            item.setString("1", forType: PROCESSED_TYPE)
+            return item
+        }
+        // Check again after materialization; never intentionally publish a stale copy.
+        guard pasteboard.changeCount == lastChangeCount else { return }
+        let ownedCount = pasteboard.clearContents()
+        guard pasteboard.changeCount == ownedCount else { return }
+        if pasteboard.writeObjects(items) {
+            let published = pasteboard.changeCount
+            guard pasteboard.string(forType: PROCESSED_TYPE) == "1",
+                  pasteboard.changeCount == published else {
+                richItems = nil
+                paths = []
+                pathMode = nil
+                return
+            }
+            lastChangeCount = published
+            pathMode = wantsPaths
+        } else {
+            richItems = nil
+            paths = []
+            pathMode = nil
+            print("[\(APP_NAME)] Could not publish clipboard formats")
+        }
     }
 }
-
 // Service & CLI Management
 func getExecutablePath() -> String {
     let arg0 = CommandLine.arguments[0]

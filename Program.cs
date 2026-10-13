@@ -17,7 +17,7 @@ namespace ClipBridge
     static class Program
     {
         public const string APP_NAME = "clipbridge";
-        public const string APP_VERSION = "1.1.2";
+        public const string APP_VERSION = "1.2.0";
         public const string PROCESSED_TYPE = "com.antigravity.clipbridge.processed";
         public const string REG_RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
         public const string REG_VALUE_NAME = "ClipBridge";
@@ -40,6 +40,26 @@ namespace ClipBridge
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetClipboardSequenceNumber();
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+        private delegate void WinEventCallback(IntPtr hook, uint eventType, IntPtr hwnd,
+            int objectId, int childId, uint threadId, uint eventTime);
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module,
+            WinEventCallback callback, uint processId, uint threadId, uint flags);
+        [DllImport("user32.dll")]
+        private static extern bool UnhookWinEvent(IntPtr hook);
+
+        private static MediaClipboard s_media;
+        private static uint s_mediaSequence;
+        private static bool? s_pathMode;
+        private static bool s_publishing;
+        private static bool s_updatePending;
 
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetConsoleWindow();
@@ -369,6 +389,8 @@ namespace ClipBridge
             private const int WM_CLIPBOARDUPDATE = 0x031D;
             public event EventHandler ClipboardUpdated;
             public event EventHandler ConfigReloadRequested;
+            private WinEventCallback _foregroundCallback;
+            private IntPtr _foregroundHook;
 
             public ClipboardListenerWindow()
             {
@@ -377,6 +399,10 @@ namespace ClipBridge
                 cp.Caption = MSG_WND_TITLE;
                 CreateHandle(cp);
                 AddClipboardFormatListener(this.Handle);
+                _foregroundCallback = delegate { PublishForForeground(); };
+                // EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT: callback is delivered
+                // on this STA message-loop thread; timer remains a fallback for busy copies.
+                _foregroundHook = SetWinEventHook(3, 3, IntPtr.Zero, _foregroundCallback, 0, 0, 0);
             }
 
             protected override void WndProc(ref Message m)
@@ -411,6 +437,7 @@ namespace ClipBridge
 
             public void Dispose()
             {
+                if (_foregroundHook != IntPtr.Zero) UnhookWinEvent(_foregroundHook);
                 RemoveClipboardFormatListener(this.Handle);
                 DestroyHandle();
             }
@@ -465,8 +492,20 @@ namespace ClipBridge
                         OnExternalConfigReload();
                     };
 
+                    using (System.Windows.Forms.Timer foregroundTimer = new System.Windows.Forms.Timer())
                     using (s_trayIcon = CreateTrayIcon())
                     {
+                        foregroundTimer.Interval = 150;
+                        foregroundTimer.Tick += delegate
+                        {
+                            if (s_updatePending && !s_publishing)
+                            {
+                                s_updatePending = false;
+                                OnClipboardUpdated();
+                            }
+                            PublishForForeground();
+                        };
+                        foregroundTimer.Start();
                         Application.Run();
                         s_trayIcon.Visible = false;
                     }
@@ -479,6 +518,7 @@ namespace ClipBridge
             }
             finally
             {
+                RestoreAndClearMedia();
                 try
                 {
                     if (File.Exists(GetPidFilePath())) File.Delete(GetPidFilePath());
@@ -495,7 +535,7 @@ namespace ClipBridge
 
         private static void OnExternalConfigReload()
         {
-            Config = AppConfig.Load();
+            ApplyConfiguration(AppConfig.Load());
             Log(string.Format("Config reloaded from settings UI: enabled={0}, dir={1}", Config.Enabled, Config.GetEffectiveStorageDir()));
             if (s_trayIcon != null)
             {
@@ -503,234 +543,256 @@ namespace ClipBridge
             }
         }
 
-        private static void OnClipboardUpdated()
+        // Own materialized formats so changing the foreground app never depends on
+        // an old clipboard owner (or a disposed image/stream).
+        private sealed class MediaClipboard : IDisposable
         {
-            // Give writing application a moment to finish populating clipboard
-            ExecuteWithClipboardRetry(delegate
+            public DataObject Rich = new DataObject();
+            public DataObject Paths = new DataObject();
+            public List<IDisposable> Resources = new List<IDisposable>();
+            public void Dispose()
             {
-                AppConfig cfg = Config;
-                if (cfg == null || !cfg.Enabled)
-                {
-                    return;
-                }
-                string storageDir = cfg.GetEffectiveStorageDir();
-
-                // 1. If clipboard contains our processed marker, skip to avoid feedback loop
-                if (Clipboard.ContainsData(PROCESSED_TYPE))
-                {
-                    return;
-                }
-
-                // 1.5 Office apps (PowerPoint/Excel/Word) attach OLE object formats when copying
-                // shapes/text-boxes/slides, together with a PNG preview of the shape. That is
-                // rich document content, NOT a screenshot: hijacking it would replace the
-                // copied text with a file path. Real screenshots / browser image copies never
-                // carry OLE formats, so skip whenever one is present.
-                if (Clipboard.ContainsData("Embed Source") ||
-                    Clipboard.ContainsData("Object Descriptor") ||
-                    Clipboard.ContainsData("Link Source") ||
-                    Clipboard.ContainsData("Link Source Descriptor"))
-                {
-                    return;
-                }
-
-                // 2. Check if clipboard contains file drop (e.g. copied an image from Explorer)
-                if (Clipboard.ContainsFileDropList())
-                {
-                    StringCollection files = Clipboard.GetFileDropList();
-                    if (files != null && files.Count > 0)
-                    {
-                        string firstFile = files[0];
-                        if (File.Exists(firstFile))
-                        {
-                            string ext = Path.GetExtension(firstFile).ToLowerInvariant();
-                            // Only formats GDI+ can actually decode; webp/heic would throw in Image.FromFile
-                            string[] imageExts = new string[] { ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".ico" };
-                            bool isImage = false;
-                            for (int i = 0; i < imageExts.Length; i++)
-                            {
-                                if (imageExts[i] == ext)
-                                {
-                                    isImage = true;
-                                    break;
-                                }
-                            }
-
-                            if (isImage)
-                            {
-                                string currentText = Clipboard.ContainsText() ? Clipboard.GetText() : null;
-                                if (currentText != firstFile)
-                                {
-                                    EnrichPasteboardWithExistingFile(firstFile);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                // 3. Check if clipboard contains an image (Screenshot or copied image)
-                bool hasImage = Clipboard.ContainsImage() || Clipboard.ContainsData("PNG") || Clipboard.ContainsData(DataFormats.Bitmap);
-                if (!hasImage)
-                {
-                    return;
-                }
-
-                byte[] pngBytes = null;
-                Image image = null;
-
-                // Check for high-fidelity PNG stream (e.g. modern browser, Snipaste, etc.)
-                if (Clipboard.ContainsData("PNG"))
-                {
-                    object rawPng = Clipboard.GetData("PNG");
-                    byte[] rawBytes = rawPng is MemoryStream ? ((MemoryStream)rawPng).ToArray() : rawPng as byte[];
-                    if (rawBytes != null)
-                    {
-                        pngBytes = rawBytes;
-                        try
-                        {
-                            // GDI+ requires the stream to stay open for the lifetime of the Image,
-                            // so hand over ownership instead of disposing it here.
-                            image = Image.FromStream(new MemoryStream(rawBytes));
-                        }
-                        catch { image = null; }
-                    }
-                }
-
-                // If no raw PNG stream, extract via GDI Bitmap
-                if (image == null && Clipboard.ContainsImage())
-                {
-                    image = Clipboard.GetImage();
-                    if (image != null)
-                    {
-                        using (MemoryStream ms = new MemoryStream())
-                        {
-                            image.Save(ms, ImageFormat.Png);
-                            pngBytes = ms.ToArray();
-                        }
-                    }
-                }
-
-                if (image == null || pngBytes == null)
-                {
-                    return;
-                }
-
-                // 4. Save to storage dir
-                string filename = string.Format("screenshot_{0}.png", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
-                string filePath = Path.Combine(storageDir, filename);
-
-                File.WriteAllBytes(filePath, pngBytes);
-                Log(string.Format("Image captured: {0}", filePath));
-
-                // 5. Re-populate multi-type clipboard
-                using (image)
-                using (MemoryStream ms = new MemoryStream(pngBytes))
-                {
-                    DataObject data = new DataObject();
-                    // Rich image formats for WeChat, Feishu, Slack, Discord, Browsers
-                    data.SetData("PNG", false, ms);
-                    data.SetData(DataFormats.Bitmap, image);
-
-                    // Embedded RTF image so Office apps (Word/Excel/PowerPoint/WPS) paste the
-                    // actual image instead of the file path text (they rank plain text above bitmaps)
-                    if (cfg.AddRtf)
-                    {
-                        string rtf = BuildRtfWithEmbeddedPng(pngBytes, image);
-                        if (rtf != null)
-                        {
-                            data.SetData(DataFormats.Rtf, false, new MemoryStream(Encoding.ASCII.GetBytes(rtf)));
-                        }
-                    }
-
-                    // Plain text file path for Terminal, PowerShell, CMD, VS Code, Anti Gravity CLI
-                    data.SetData(DataFormats.UnicodeText, filePath);
-                    data.SetData(DataFormats.Text, filePath);
-
-                    // File drop format for Windows File Explorer
-                    if (cfg.AddFileDrop)
-                    {
-                        data.SetData(DataFormats.FileDrop, new string[] { filePath });
-                    }
-
-                    // Marker to prevent self-loop
-                    data.SetData(PROCESSED_TYPE, "1");
-
-                    SetClipboardWithRetry(data);
-                }
-
-                // 6. Housekeeping & Memory optimization
-                CleanupOldScreenshots(storageDir, cfg.MaxAgeDays, cfg.MaxCount);
-                TrimMemory();
-            });
+                for (int i = Resources.Count - 1; i >= 0; i--) Resources[i].Dispose();
+            }
         }
 
-        private static void EnrichPasteboardWithExistingFile(string filePath)
+        private static void ClearMedia()
+        {
+            if (s_media != null) s_media.Dispose();
+            s_media = null;
+            s_pathMode = null;
+        }
+
+        private static void RestoreAndClearMedia()
+        {
+            if (s_media != null && s_pathMode == true)
+                SetClipboardWithRetry(s_media.Rich, s_mediaSequence);
+            ClearMedia();
+        }
+
+        public static void ApplyConfiguration(AppConfig config)
+        {
+            if (!config.Enabled) RestoreAndClearMedia();
+            Config = config;
+            s_pathMode = null;
+            PublishForForeground();
+        }
+
+        private static bool IsPathProcess(string name, string configured)
+        {
+            foreach (string entry in configured.Split(','))
+                if (string.Equals(name, entry.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private static bool ForegroundWantsPaths()
         {
             try
             {
-                AppConfig cfg = Config;
-                if (cfg == null || !cfg.Enabled || !File.Exists(filePath)) return;
-
-                byte[] pngBytes = null;
-                Image image = null;
-                string ext = Path.GetExtension(filePath).ToLowerInvariant();
-
-                if (ext == ".png")
-                {
-                    pngBytes = File.ReadAllBytes(filePath);
-                    // Stream ownership is handed to the Image (GDI+ needs it alive)
-                    image = Image.FromStream(new MemoryStream(pngBytes));
-                }
-                else
-                {
-                    using (Image orig = Image.FromFile(filePath))
-                    {
-                        using (MemoryStream ms = new MemoryStream())
-                        {
-                            orig.Save(ms, ImageFormat.Png);
-                            pngBytes = ms.ToArray();
-                        }
-                        image = new Bitmap(orig);
-                    }
-                }
-
-                using (image)
-                using (MemoryStream ms = new MemoryStream(pngBytes))
-                {
-                    DataObject data = new DataObject();
-                    data.SetData("PNG", false, ms);
-                    data.SetData(DataFormats.Bitmap, image);
-
-                    if (cfg.AddRtf)
-                    {
-                        string rtf = BuildRtfWithEmbeddedPng(pngBytes, image);
-                        if (rtf != null)
-                        {
-                            data.SetData(DataFormats.Rtf, false, new MemoryStream(Encoding.ASCII.GetBytes(rtf)));
-                        }
-                    }
-
-                    data.SetData(DataFormats.UnicodeText, filePath);
-                    data.SetData(DataFormats.Text, filePath);
-                    if (cfg.AddFileDrop)
-                    {
-                        data.SetData(DataFormats.FileDrop, new string[] { filePath });
-                    }
-                    data.SetData(PROCESSED_TYPE, "1");
-
-                    SetClipboardWithRetry(data);
-                    Log(string.Format("File path enriched: {0}", filePath));
-                }
-
-                TrimMemory();
+                uint pid;
+                GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                using (Process p = Process.GetProcessById((int)pid))
+                    return IsPathProcess(p.ProcessName, Config.PathProcesses);
             }
-            catch (Exception ex)
+            catch { return false; }
+        }
+
+        private static void PublishForForeground()
+        {
+            if (s_publishing) return;
+            try { PublishForForegroundCore(); }
+            catch (ExternalException) { /* Retry on the next timer tick. */ }
+            catch (Exception ex) { Log("Foreground clipboard error: " + ex.Message); }
+        }
+
+        private static void PublishForForegroundCore()
+        {
+            if (s_media == null) return;
+            if (GetClipboardSequenceNumber() != s_mediaSequence)
             {
-                Log(string.Format("Error enriching file path: {0}", ex.Message));
+                ClearMedia(); // A new copy always wins, even before its WM_CLIPBOARDUPDATE arrives.
+                return;
+            }
+            if (Config == null || !Config.Enabled) return;
+            bool paths = ForegroundWantsPaths();
+            if (s_pathMode == paths) return;
+            if (SetClipboardWithRetry(paths ? s_media.Paths : s_media.Rich, s_mediaSequence))
+            {
+                uint published = GetClipboardSequenceNumber();
+                // A copy can arrive immediately after our write. Do not claim that
+                // newer sequence as ours and restore stale media on the next app switch.
+                if (!Clipboard.ContainsData(PROCESSED_TYPE) || GetClipboardSequenceNumber() != published)
+                {
+                    ClearMedia();
+                    return;
+                }
+                s_mediaSequence = published;
+                s_pathMode = paths;
             }
         }
 
+        private static bool IsMediaFile(string path)
+        {
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            return Array.IndexOf(new string[] {
+                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".ico",
+                ".webp", ".heic", ".heif", ".svg", ".avif",
+                ".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma", ".aiff",
+                ".mp4", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".m4v", ".mpeg", ".mpg"
+            }, ext) >= 0;
+        }
+
+        private static void AddPaths(MediaClipboard media, string[] files)
+        {
+            // One raw absolute path per line: intended as context for coding assistants,
+            // not as a shell command (no shell-dependent quoting).
+            string text = string.Join(Environment.NewLine, files);
+            media.Paths.SetData(DataFormats.UnicodeText, text);
+            media.Paths.SetData(DataFormats.Text, text);
+            media.Paths.SetData(PROCESSED_TYPE, "1");
+            media.Rich.SetData(PROCESSED_TYPE, "1");
+        }
+
+        private static DataObject SnapshotFormats(IDataObject source, MediaClipboard media)
+        {
+            DataObject result = new DataObject();
+            foreach (string format in source.GetFormats(false))
+            {
+                object value = source.GetData(format, false);
+                // Abort instead of silently discarding an advertised source format.
+                if (value == null) throw new InvalidOperationException("Cannot preserve " + format);
+                MemoryStream stream = value as MemoryStream;
+                Image image = value as Image;
+                if (stream != null)
+                {
+                    MemoryStream copy = new MemoryStream(stream.ToArray());
+                    media.Resources.Add(copy);
+                    value = copy;
+                }
+                else if (image != null)
+                {
+                    Image copy = new Bitmap(image);
+                    media.Resources.Add(copy);
+                    value = copy;
+                }
+                result.SetData(format, false, value);
+            }
+            return result;
+        }
+
+        private static void AddImage(MediaClipboard media, byte[] png, AppConfig cfg)
+        {
+            MemoryStream stream = new MemoryStream(png);
+            media.Resources.Add(stream);
+            Image image = Image.FromStream(stream);
+            media.Resources.Add(image);
+            media.Rich.SetData("PNG", false, stream);
+            media.Rich.SetData(DataFormats.Bitmap, image);
+            if (cfg.AddRtf)
+            {
+                string rtf = BuildRtfWithEmbeddedPng(png, image);
+                if (rtf != null)
+                {
+                    MemoryStream rtfStream = new MemoryStream(Encoding.ASCII.GetBytes(rtf));
+                    media.Resources.Add(rtfStream);
+                    media.Rich.SetData(DataFormats.Rtf, false, rtfStream);
+                }
+            }
+        }
+
+        private static void OnClipboardUpdated()
+        {
+            // OLE can pump messages while flushing clipboard data. Defer reentrant
+            // notifications so they cannot dispose the media currently being written.
+            if (s_publishing) { s_updatePending = true; return; }
+            if (s_media != null && GetClipboardSequenceNumber() == s_mediaSequence) return;
+            ClearMedia();
+            ExecuteWithClipboardRetry(delegate
+            {
+                AppConfig cfg = Config;
+                if (cfg == null || !cfg.Enabled) return;
+                uint sequence = GetClipboardSequenceNumber();
+                IDataObject source = Clipboard.GetDataObject();
+                if (source == null || source.GetDataPresent(PROCESSED_TYPE)) return;
+                if (source.GetDataPresent("Embed Source") || source.GetDataPresent("Object Descriptor") ||
+                    source.GetDataPresent("Link Source") || source.GetDataPresent("Link Source Descriptor")) return;
+
+                MediaClipboard media = new MediaClipboard();
+                bool retained = false;
+                try
+                {
+                    if (source.GetDataPresent(DataFormats.FileDrop))
+                    {
+                        string[] files = source.GetData(DataFormats.FileDrop) as string[];
+                        if (files == null || files.Length == 0) return;
+                        bool hasMedia = false;
+                        foreach (string file in files) if (IsMediaFile(file)) hasMedia = true;
+                        // Preserve mixed selections, including directories/non-media siblings.
+                        // Unrelated file copies are left completely untouched.
+                        if (!hasMedia) return;
+                        media.Rich = SnapshotFormats(source, media);
+                        media.Rich.SetData(DataFormats.FileDrop, false, files);
+                        if (files.Length == 1 && File.Exists(files[0]))
+                        {
+                            string ext = Path.GetExtension(files[0]).ToLowerInvariant();
+                            if (Array.IndexOf(new string[] { ".png", ".jpg", ".jpeg", ".gif",
+                                ".bmp", ".tif", ".tiff", ".ico" }, ext) >= 0)
+                            {
+                                try
+                                {
+                                    using (Image image = Image.FromFile(files[0]))
+                                    using (MemoryStream png = new MemoryStream())
+                                    {
+                                        image.Save(png, ImageFormat.Png);
+                                        AddImage(media, png.ToArray(), cfg);
+                                    }
+                                }
+                                catch (Exception ex) { Log("Image preview unavailable: " + ex.Message); }
+                            }
+                        }
+                        AddPaths(media, files); // Original FileDrop survives even with add_filedrop=0.
+                    }
+                    else
+                    {
+                        byte[] png = null;
+                        if (source.GetDataPresent("PNG"))
+                        {
+                            object raw = source.GetData("PNG");
+                            png = raw is MemoryStream ? ((MemoryStream)raw).ToArray() : raw as byte[];
+                        }
+                        if (png == null)
+                        {
+                            using (Image image = source.GetData(DataFormats.Bitmap) as Image)
+                            {
+                                if (image == null) return;
+                                using (MemoryStream stream = new MemoryStream())
+                                {
+                                    image.Save(stream, ImageFormat.Png);
+                                    png = stream.ToArray();
+                                }
+                            }
+                        }
+                        AddImage(media, png, cfg);
+                        if (GetClipboardSequenceNumber() != sequence) return;
+                        string dir = cfg.GetEffectiveStorageDir();
+                        string path = Path.Combine(dir, "screenshot_" +
+                            DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + "_" +
+                            Guid.NewGuid().ToString("N") + ".png");
+                        File.WriteAllBytes(path, png);
+                        if (cfg.AddFileDrop) media.Rich.SetData(DataFormats.FileDrop, new string[] { path });
+                        AddPaths(media, new string[] { path });
+                        Log("Image captured: " + path);
+                        CleanupOldScreenshots(dir, cfg.MaxAgeDays, cfg.MaxCount);
+                    }
+                    if (GetClipboardSequenceNumber() != sequence) return;
+                    s_media = media;
+                    s_mediaSequence = sequence;
+                    retained = true;
+                    PublishForForeground();
+                }
+                finally { if (!retained) media.Dispose(); }
+            });
+        }
         /// <summary>
         /// Builds an RTF document with the given PNG embedded as a \pngblip picture.
         /// Office apps (Word/Excel/PowerPoint/WPS) prefer RTF over plain text, so they will
@@ -797,25 +859,40 @@ namespace ClipBridge
             }
         }
 
-        private static void SetClipboardWithRetry(DataObject data, int maxRetries = 8, int delayMs = 25)
+        private static bool SetClipboardWithRetry(DataObject data, uint expectedSequence, int maxRetries = 8, int delayMs = 25)
+        {
+            s_publishing = true;
+            try
+            {
+                return TryPublishClipboard(data, expectedSequence, GetClipboardSequenceNumber,
+                    delegate(DataObject value) { Clipboard.SetDataObject(value, true, 0, 0); },
+                    Thread.Sleep, maxRetries, delayMs);
+            }
+            finally { s_publishing = false; }
+        }
+
+        private static bool TryPublishClipboard(DataObject data, uint expectedSequence,
+            Func<uint> sequence, Action<DataObject> write, Action<int> wait, int maxRetries, int delayMs)
         {
             for (int i = 0; i < maxRetries; i++)
             {
                 try
                 {
-                    Clipboard.SetDataObject(data, true);
-                    return;
+                    if (sequence() != expectedSequence) return false;
+                    write(data);
+                    return true;
                 }
                 catch (ExternalException)
                 {
-                    Thread.Sleep(delayMs);
+                    wait(delayMs);
                 }
                 catch (Exception ex)
                 {
                     Log("Error setting clipboard: " + ex.Message);
-                    return;
+                    return false;
                 }
             }
+            return false;
         }
 
         #endregion
@@ -867,7 +944,7 @@ namespace ClipBridge
                 AppConfig cfg = Config != null ? Config : AppConfig.Load();
                 cfg.Enabled = !cfg.Enabled;
                 cfg.Save();
-                Config = cfg;
+                ApplyConfiguration(cfg);
                 Log("Listening " + (cfg.Enabled ? "resumed" : "paused") + " from tray menu.");
                 tray.ShowBalloonTip(1200, "ClipBridge",
                     cfg.Enabled ? "Listening resumed." : "Listening paused.",
@@ -1350,9 +1427,9 @@ Usage:
   clipbridge --help     # Show this help message
 
 Features:
-  - Multi-type Clipboard: Terminal pastes file path; WeChat/Feishu/Slack paste image;
+  - Foreground-aware media clipboard: CLI pastes paths; other apps get images/files;
     Word/Excel/PowerPoint paste embedded image via RTF.
-  - 0% Idle CPU: Uses Win32 AddClipboardFormatListener (event-driven, no polling).
+  - Clipboard events plus foreground-window events and a 150ms foreground check.
   - Ultra Lightweight: Native C# (.NET Framework), resident memory ~2-8 MB.
   - Tray icon with settings UI; config at ~/.agy_screenshots/config.ini.
   - Auto Cleanup: Retains last N days (max M images), configurable in settings.
@@ -1377,6 +1454,7 @@ Features:
         public bool Enabled = true;
         public bool AddRtf = true;
         public bool AddFileDrop = true;
+        public string PathProcesses = "WindowsTerminal,WindowsTerminalPreview,cmd,powershell,pwsh,conhost,OpenConsole,Code,Cursor,Codex";
 
         public string GetEffectiveStorageDir()
         {
@@ -1420,6 +1498,7 @@ Features:
                             case "enabled": c.Enabled = v != "0"; break;
                             case "add_rtf": c.AddRtf = v != "0"; break;
                             case "add_filedrop": c.AddFileDrop = v != "0"; break;
+                            case "path_processes": c.PathProcesses = v; break;
                         }
                     }
                 }
@@ -1449,6 +1528,7 @@ Features:
                 sb.AppendLine("enabled=" + (Enabled ? "1" : "0"));
                 sb.AppendLine("add_rtf=" + (AddRtf ? "1" : "0"));
                 sb.AppendLine("add_filedrop=" + (AddFileDrop ? "1" : "0"));
+                sb.AppendLine("path_processes=" + PathProcesses);
                 File.WriteAllText(Program.GetConfigPath(), sb.ToString(), Encoding.UTF8);
             }
             catch { }
@@ -1634,6 +1714,8 @@ Features:
         private AppConfig CollectFromUi()
         {
             AppConfig cfg = new AppConfig();
+            cfg.PathProcesses = (_insideDaemon && Program.Config != null
+                ? Program.Config : AppConfig.Load()).PathProcesses;
             cfg.Enabled = _chkEnabled.Checked;
             cfg.AutoStart = _chkAutoStart.Checked;
             cfg.AddRtf = _chkRtf.Checked;
@@ -1680,7 +1762,7 @@ Features:
 
             if (_insideDaemon)
             {
-                Program.Config = cfg; // hot-apply in this (daemon) process
+                Program.ApplyConfiguration(cfg); // hot-apply in this (daemon) process
             }
             else
             {
@@ -1707,7 +1789,7 @@ Features:
             cfg.Save();
             if (_insideDaemon)
             {
-                Program.Config = cfg;
+                Program.ApplyConfiguration(cfg);
             }
             else
             {
@@ -1826,10 +1908,10 @@ Features:
 
             Label lblDesc = new Label();
             lblDesc.Text = "自动捕获截图（Win+Shift+S / 微信 / Snipaste 等）并保存为 PNG：\n\n" +
-                           "  •  终端 / PowerShell / VS Code 中粘贴  →  图片文件路径\n" +
+                           "  •  终端 / PowerShell / VS Code 中粘贴  →  媒体文件路径\n" +
                            "  •  微信 / 飞书 / Slack 中粘贴  →  图片本身\n" +
                            "  •  Word / Excel 中粘贴  →  图片本身（内嵌）\n\n" +
-                           "截图自动保存、自动清理，零依赖，空闲 CPU 0%。";
+                           "支持图片 / 音频 / 视频与多选，截图自动保存、自动清理。";
             lblDesc.SetBounds(16, 78, 390, 110);
             Controls.Add(lblDesc);
 
